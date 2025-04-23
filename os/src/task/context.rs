@@ -2,6 +2,8 @@
 
 #[derive(Copy, Clone)]
 #[repr(C)]
+
+#[derive(Debug)]
 /// task context structure containing some registers
 pub struct TaskContext {
     /// Ret position after task switching
