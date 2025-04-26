@@ -271,3 +271,88 @@ where
 }
 /// a simple range structure for virtual page number
 pub type VPNRange = SimpleRange<VirtPageNum>;
+// 物理地址/虚拟地址及其页号的类型安全实现
+// 核心设计：通过新类型模式保证不同类型地址/页号的类型安全，避免数值误用
+
+/// SV39分页模式常量定义（RISC-V 64位架构）
+const PA_WIDTH_SV39: usize = 56;  // 物理地址实际使用56位（低56位有效）
+const VA_WIDTH_SV39: usize = 39;  // 虚拟地址使用39位地址空间
+const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS; // 物理页号44位（56-12）
+const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS; // 虚拟页号27位（39-12）
+
+/// 物理地址结构体（封装usize实现类型安全）
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct PhysAddr(pub usize);
+
+impl PhysAddr {
+    /// 物理地址→物理页号转换（要求地址按页对齐）
+    pub fn floor(&self) -> PhysPageNum {
+        PhysPageNum(self.0 / PAGE_SIZE) // 右移12位取高44位
+    }
+    
+    /// 获取页内偏移（低12位）
+    pub fn page_offset(&self) -> usize {
+        self.0 & (PAGE_SIZE - 1) // 掩码操作取低12位
+    }
+    
+    /// 不安全的内存访问（直接操作物理地址）
+    /// 注意：调用者必须保证地址有效性和生命周期正确性
+    pub unsafe fn get_mut<T>(&self) -> &'static mut T {
+        (self.0 as *mut T).as_mut().unwrap() // 裸指针转换
+    }
+}
+
+/// 虚拟页号的三级页表索引计算（SV39规范）
+impl VirtPageNum {
+    pub fn indexes(&self) -> [usize; 3] {
+        let mut vpn = self.0;
+        let mut idx = [0usize; 3];
+        // 从高到低依次取9位索引（三级页表结构）
+        for i in (0..3).rev() { 
+            idx[i] = vpn & 0x1FF; // 取最后9位（2^9=512项/页表）
+            vpn >>= 9;            // 右移处理下一级
+        }
+        idx
+    }
+}
+
+/// 物理页号到页表项的转换（内存映射关键操作）
+impl PhysPageNum {
+    /// 获取页表项数组（512项，对应9位索引）
+    /// 安全注意：必须确保该物理页确实是页表页
+    pub unsafe fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
+        let pa: PhysAddr = (*self).into();
+        core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512)
+    }
+}
+
+/// 地址转换trait实现（核心位操作）
+impl From<usize> for PhysAddr {
+    fn from(v: usize) -> Self {
+        // 掩码操作确保物理地址有效性：(1 << 56) - 1
+        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+    }
+}
+
+/// 页号范围迭代器实现（内存映射区域遍历）
+impl<T> Iterator for SimpleRangeIterator<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.end {
+            None
+        } else {
+            let t = self.current;
+            self.current.step(); // 调用StepByOne trait的步进方法
+            Some(t)
+        }
+    }
+}
+
+//  类型安全设计：
+//  1. 物理地址/虚拟地址通过不同结构体区分，禁止直接运算
+// 2. 页号转换方法返回对应类型（PhysPageNum/VirtPageNum）
+//  3. 所有unsafe操作集中标注，强制调用者考虑安全性
+//  4. 内存对齐通过assert_eq!在转换时检查
